@@ -18,13 +18,18 @@ import time
 from collections import deque
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CAM_INDICES = [0, 1]
+MAX_CAMS      = 2          # use up to this many auto-detected capture cameras
+CAM_W, CAM_H  = 4000, 1200  # native DECXIN stereo frame (2000x1200 per eye)
+CAM_FPS       = 30
+USE_HW_DECODE = True        # Jetson hardware MJPEG decode (nvv4l2decoder) ~3x faster than CPU
+                            # Capture nodes are auto-detected, so USB re-enumeration / index
+                            # churn no longer matters (see find_capture_devices()).
 # Each eye is 2000×1200 → aspect 5:3.  At eye_w=700px → correct height=420px.
 W           = 1400
 EYE_H       = 420          # correct aspect ratio (700 * 3/5 = 420)
-VIDEO_H     = len(CAM_INDICES) * EYE_H   # 840
+VIDEO_H     = MAX_CAMS * EYE_H            # resized to the actual camera count in main()
 PANEL_H     = 240
-H           = VIDEO_H + PANEL_H          # 1080
+H           = VIDEO_H + PANEL_H
 BOX_W       = 340
 
 # ICM-42688 default scale (as used by official sample)
@@ -272,17 +277,95 @@ def draw_graphs(canvas, histories, x0, y0, gw, gh):
                 cv2.line(canvas, pts[i-1], pts[i], sc, 1, cv2.LINE_AA)
 
 
+# ── Capture device discovery + hardware-decode pipeline ───────────────────────
+
+import subprocess, re
+import glob as _glob
+
+
+def find_capture_devices():
+    """Return real MJPG-capable /dev/video* capture nodes (not metadata nodes),
+    in stable numeric order. Robust to USB re-enumeration / index churn."""
+    paths = sorted(_glob.glob('/dev/video*'),
+                   key=lambda p: int(re.sub(r'\D', '', p) or 0))
+    devs = []
+    for path in paths:
+        try:
+            out = subprocess.check_output(['v4l2-ctl', '-d', path, '--list-formats'],
+                                          stderr=subprocess.DEVNULL, text=True)
+        except Exception:
+            continue
+        if 'Video Capture' in out and 'MJPG' in out:
+            devs.append(path)
+    return devs
+
+
+def _gst_pipeline(dev):
+    """GStreamer pipeline using the Jetson hardware JPEG decoder (nvv4l2decoder).
+    drop=1/max-buffers=1 keeps only the freshest frame (low latency, no backlog)."""
+    return (f"v4l2src device={dev} io-mode=2 ! "
+            f"image/jpeg,width={CAM_W},height={CAM_H},framerate={CAM_FPS}/1 ! "
+            f"nvv4l2decoder mjpeg=1 ! nvvidconv ! video/x-raw,format=BGRx ! "
+            f"videoconvert ! video/x-raw,format=BGR ! "
+            f"appsink drop=1 max-buffers=1 sync=false")
+
+
+class Camera:
+    """A capture device that self-reconnects if it drops off the USB bus."""
+    RECONNECT_AFTER = 30   # consecutive failed reads (~1 s) before reopening
+
+    def __init__(self, dev):
+        self.dev  = dev
+        self.cap  = None
+        self.fails = 0
+        self._open()
+
+    def _open(self):
+        if self.cap is not None:
+            self.cap.release()
+        if USE_HW_DECODE:
+            self.cap = cv2.VideoCapture(_gst_pipeline(self.dev), cv2.CAP_GSTREAMER)
+        if not USE_HW_DECODE or not self.cap.isOpened():
+            # CPU-decode fallback (slower) if GStreamer/HW decode is unavailable
+            idx = int(re.sub(r'\D', '', self.dev) or 0)
+            self.cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.fails = 0
+
+    def read(self):
+        """Return a frame, or None if temporarily unavailable. Never raises."""
+        if self.cap is None or not self.cap.isOpened():
+            self._open()
+        ret, f = self.cap.read() if self.cap is not None else (False, None)
+        if not ret or f is None:
+            self.fails += 1
+            if self.fails >= self.RECONNECT_AFTER:
+                self._open()
+            return None
+        self.fails = 0
+        return f
+
+    def release(self):
+        if self.cap is not None:
+            self.cap.release()
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    caps = []
-    for idx in CAM_INDICES:
-        c = cv2.VideoCapture(idx)
-        if not c.isOpened():
-            print(f'Cannot open camera {idx}'); return
-        print(f'  Camera {idx}: {int(c.get(cv2.CAP_PROP_FRAME_WIDTH))}×'
-              f'{int(c.get(cv2.CAP_PROP_FRAME_HEIGHT))}')
-        caps.append(c)
+    devs = find_capture_devices()[:MAX_CAMS]
+    if not devs:
+        print('No MJPG capture cameras found on /dev/video*'); return
+    caps = [Camera(d) for d in devs]
+    decode = 'hardware (nvv4l2decoder)' if USE_HW_DECODE else 'CPU'
+    for d in devs:
+        print(f'  Camera {d}  ({decode} decode)')
+
+    # Size the canvas to the actual number of cameras found
+    global VIDEO_H, H
+    VIDEO_H = len(caps) * EYE_H
+    H       = VIDEO_H + PANEL_H
 
     filters  = [OrientationFilter() for _ in caps]
     # histories[cam][axis] = deque of float values
@@ -291,6 +374,8 @@ def main():
     fps_hist    = deque(maxlen=30)
     t_last      = time.time()
     show_graphs = False   # toggle with G
+    last_frames = [None] * len(caps)   # reuse last good frame while a camera reconnects
+    frame_n     = 0
 
     cv2.namedWindow('DECXIN Dual IMU', cv2.WINDOW_NORMAL)
     cv2.resizeWindow('DECXIN Dual IMU', W, H)
@@ -302,11 +387,18 @@ def main():
         t_last = now
 
         frames = []
-        for c in caps:
-            ret, f = c.read()
-            if not ret: break
+        for ci, c in enumerate(caps):
+            f = c.read()
+            if f is None:
+                f = last_frames[ci]            # camera hiccuped → reuse last good frame
+            else:
+                last_frames[ci] = f
+            if f is None:                       # no frame ever received yet → placeholder
+                f = np.zeros((CAM_H, CAM_W, 3), np.uint8)
+                cv2.putText(f, f'{c.dev}  waiting for signal...',
+                            (60, CAM_H // 2), cv2.FONT_HERSHEY_SIMPLEX,
+                            3.0, (60, 60, 210), 5, cv2.LINE_AA)
             frames.append(f)
-        if len(frames) < len(caps): break
 
         canvas = np.zeros((H, W, 3), np.uint8)
         eye_w  = W // 2
@@ -411,6 +503,9 @@ def main():
 
         # ── HUD ───────────────────────────────────────────────────────────
         fps = np.mean(fps_hist)
+        frame_n = frame_n + 1
+        if frame_n % 60 == 0:
+            print(f'fps={fps:.1f}', flush=True)
         cv2.putText(canvas,f'{fps:.1f} fps',(W-80,16),
                     cv2.FONT_HERSHEY_SIMPLEX,0.45,(150,255,150),1,cv2.LINE_AA)
         cv2.putText(canvas,'Q=quit  R=reset',(W-130,H-2),
